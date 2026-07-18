@@ -12,7 +12,7 @@ cd "$PROJECT_ROOT"
 
 RUN_TAG="${RUN_TAG:-$(basename "$RUN_CONFIG" .json)}"
 
-OUTPUT_DIR="$PROJECT_ROOT/ehrshot_state_or_space_final_sequence_results/$RUN_TAG"
+OUTPUT_DIR="${OUTPUT_DIR:-ehrshot_state_or_space_final_sequence_results/$RUN_TAG}"
 
 SEQUENCE_S3_PREFIX="$EHRSHOT_S3_BASE/ehrshot_state_or_space_sequence_datasets"
 RESULTS_S3_PREFIX="$EHRSHOT_S3_BASE/ehrshot_state_or_space_final_sequence_results/$RUN_TAG"
