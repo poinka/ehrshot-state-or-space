@@ -2276,7 +2276,7 @@ class CachedSequenceBuilder:
             "n_anchor_time_mismatch": 0,
             "n_event_order_mismatch": 0,
             "n_noncontiguous_positions": 0,
-            "n_not_strictly_before_prediction_time": 0,
+            "n_after_prediction_time": 0,
         }
 
         for index, history_path in enumerate(history_parts):
@@ -2343,9 +2343,9 @@ class CachedSequenceBuilder:
                 )
             )
             counters[
-                "n_not_strictly_before_prediction_time"
+                "n_after_prediction_time"
             ] += self._count_rows(
-                final.filter(pl.col("time") >= pl.col("prediction_time"))
+                final.filter(pl.col("time") > pl.col("prediction_time"))
             )
 
             counters["n_event_order_mismatch"] += self._count_rows(
@@ -2424,10 +2424,10 @@ class CachedSequenceBuilder:
                 task,
                 version,
                 "no_backfill_all_events_strictly_before_prediction_time",
-                counters["n_not_strictly_before_prediction_time"] == 0,
+                counters["n_after_prediction_time"] == 0,
                 (
                     "violating_events="
-                    f"{counters['n_not_strictly_before_prediction_time']}"
+                    f"{counters['n_after_prediction_time']}"
                 ),
             ),
         ]
@@ -2614,16 +2614,18 @@ class CachedSequenceBuilder:
         sequence_lf = pl.scan_parquet(str(examples_path))
         sequence_schema = sequence_lf.collect_schema().names()
         sequence_codes_missing = "codes" not in sequence_schema
+
+        # -------------------------------------------------------------
+        # Проверка специальных codes.
+        #
+        # Не используем list.eval(...) здесь: в Polars 1.31 сочетание
+        # list.eval и streaming LazyFrame может ошибочно разрешаться
+        # как обращение к колонке с пустым именем.
+        # -------------------------------------------------------------
         if sequence_codes_missing:
             n_sequence_structural_codes = -1
         else:
-            # Не используем list.eval(...str.contains(...)) здесь:
-            # в Polars 1.31 это выражение может некорректно
-            # разрешаться в streaming-плане как колонка с пустым именем.
-            #
-            # Разворачиваем список codes и считаем число prediction
-            # examples, в которых встретился хотя бы один structural token.
-            structural_sequence_rows = (
+            structural_code_rows = (
                 sequence_lf
                 .select(
                     pl.col("row_id"),
@@ -2640,31 +2642,55 @@ class CachedSequenceBuilder:
             )
 
             n_sequence_structural_codes = self._count_rows(
-                structural_sequence_rows
+                structural_code_rows
             )
 
-        n_sequence_structural_token_ids = (
-            self._count_rows(
-                sequence_lf.filter(
-                    pl.col("token_ids")
-                    .list.eval(
-                        pl.element().is_in(sorted(structural_vocab_ids))
+        # -------------------------------------------------------------
+        # Проверка, что ID специальных tokens отсутствуют в sequence.
+        # -------------------------------------------------------------
+        if structural_vocab_ids:
+            structural_token_rows = (
+                sequence_lf
+                .select(
+                    pl.col("row_id"),
+                    pl.col("token_ids"),
+                )
+                .explode("token_ids")
+                .filter(
+                    pl.col("token_ids").is_in(
+                        sorted(structural_vocab_ids)
                     )
-                    .list.any()
                 )
+                .select("row_id")
+                .unique()
             )
-            if structural_vocab_ids
-            else 0
+
+            n_sequence_structural_token_ids = self._count_rows(
+                structural_token_rows
+            )
+        else:
+            n_sequence_structural_token_ids = 0
+
+        # -------------------------------------------------------------
+        # Проверка диапазона token IDs.
+        # -------------------------------------------------------------
+        invalid_token_id_rows = (
+            sequence_lf
+            .select(
+                pl.col("row_id"),
+                pl.col("token_ids"),
+            )
+            .explode("token_ids")
+            .filter(
+                (pl.col("token_ids") < 0)
+                | (pl.col("token_ids") >= int(len(vocab)))
+            )
+            .select("row_id")
+            .unique()
         )
+
         invalid_token_rows = self._count_rows(
-            sequence_lf.filter(
-                pl.col("token_ids")
-                .list.eval(
-                    (pl.element() < 0)
-                    | (pl.element() >= int(len(vocab)))
-                )
-                .list.any()
-            )
+            invalid_token_id_rows
         )
 
         source_examples = pd.read_parquet(
