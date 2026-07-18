@@ -2614,17 +2614,35 @@ class CachedSequenceBuilder:
         sequence_lf = pl.scan_parquet(str(examples_path))
         sequence_schema = sequence_lf.collect_schema().names()
         sequence_codes_missing = "codes" not in sequence_schema
-        n_sequence_structural_codes = (
-            -1
-            if sequence_codes_missing
-            else self._count_rows(
-                sequence_lf.filter(
-                    pl.col("codes")
-                    .list.eval(pl.element().str.contains(pattern))
-                    .list.any()
+        if sequence_codes_missing:
+            n_sequence_structural_codes = -1
+        else:
+            # Не используем list.eval(...str.contains(...)) здесь:
+            # в Polars 1.31 это выражение может некорректно
+            # разрешаться в streaming-плане как колонка с пустым именем.
+            #
+            # Разворачиваем список codes и считаем число prediction
+            # examples, в которых встретился хотя бы один structural token.
+            structural_sequence_rows = (
+                sequence_lf
+                .select(
+                    pl.col("row_id"),
+                    pl.col("codes"),
                 )
+                .explode("codes")
+                .filter(
+                    pl.col("codes")
+                    .fill_null("")
+                    .str.contains(pattern)
+                )
+                .select("row_id")
+                .unique()
             )
-        )
+
+            n_sequence_structural_codes = self._count_rows(
+                structural_sequence_rows
+            )
+
         n_sequence_structural_token_ids = (
             self._count_rows(
                 sequence_lf.filter(
