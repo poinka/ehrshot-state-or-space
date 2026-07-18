@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ehrshot/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+clearml.conf
+.clearml/
+.netrc
+*.pem
+*.key
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Licensed clinical data: never commit
+EHRSHOT_MEDS/
+EHRSHOT_ASSETS/
+MIMIC*/
+
+# Generated datasets, caches and results
+ehrshot_train_only_chronic_whitelist_50/
+ehrshot_state_or_space_cache/
+ehrshot_state_or_space_sequence_datasets/
+ehrshot_state_or_space_final_sequence_results/
+ehrshot_state_or_space_final_analysis/
+checkpoints/
+logs/
+
+# Model/data artifacts
+*.parquet
+*.feather
+*.arrow
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+
+# Temporary files
+*.tmp
+*.bak
+*.log

@@ -1,0 +1,89 @@
+{
+  "files": [
+    {
+      "path": "README.md",
+      "size_bytes": 6569,
+      "sha256": "69ddd9212235e6f83a369b86ba1a4f31ac28b9113ed93d17a0d8274e68d3237a"
+    },
+    {
+      "path": "configs/state_or_space_analysis.json",
+      "size_bytes": 2040,
+      "sha256": "11569ab915fb25ebe46fe9bf03fbc4542cde872cd7245528cd7969fe2da696a4"
+    },
+    {
+      "path": "configs/state_or_space_final_sequence_runs.json",
+      "size_bytes": 4814,
+      "sha256": "9f225c34a76cdc646c0306e918de6787e4351b9580de5481587f72559ee2f5a6"
+    },
+    {
+      "path": "configs/state_or_space_sequence_datasets.json",
+      "size_bytes": 3948,
+      "sha256": "752f0f625c89e37c0d22b94c02eecd6b82dc19e8fa579fed1e43efea71950f34"
+    },
+    {
+      "path": "final_exps/00_build_train_only_persistent_whitelist.py",
+      "size_bytes": 19155,
+      "sha256": "e5c4041759900dd4855e5e6dbe8cc3e4bb1d57e1e6f85da54478564402115e6d"
+    },
+    {
+      "path": "final_exps/01_build_sequence_datasets.py",
+      "size_bytes": 118777,
+      "sha256": "d00c4dd327f625a42608e09e1c0814dade0a34d037ee50a09753e79682c42622"
+    },
+    {
+      "path": "final_exps/02_train_sequence_multiseed.py",
+      "size_bytes": 94597,
+      "sha256": "5bd48de5639ad6bb50e48eebf8102ceca31e13d4d0d8bdf3f29f85b78e5984fe"
+    },
+    {
+      "path": "final_exps/03_analyze_state_or_space.py",
+      "size_bytes": 23428,
+      "sha256": "7ce372d8aa057446b88085d409414280655bf8c59375dbd6ea842e9ea19b824e"
+    },
+    {
+      "path": "final_exps/common_ehrshot_eval.py",
+      "size_bytes": 53541,
+      "sha256": "69f91db51527b227d25b35c4626fbb1923f513811b327c1aceeaeac677e79a69"
+    },
+    {
+      "path": "requirements.txt",
+      "size_bytes": 247,
+      "sha256": "6557e25cfd2e67ef66c03d98a0856ca3323dd698f98d5520210ec4d0bd4f91d6"
+    },
+    {
+      "path": "scripts/00_check_environment.sh",
+      "size_bytes": 1873,
+      "sha256": "7a57273db235cab9a8f2200c20130c7c894341bff303c270fd1da972086a13b7"
+    },
+    {
+      "path": "scripts/01_run_whitelist_clearml.sh",
+      "size_bytes": 580,
+      "sha256": "08abbf1d3443df2e93d89a51b0af82b126e338ef63a0a6688e6d8c158d48ac63"
+    },
+    {
+      "path": "scripts/02_run_dataset_builder_clearml.sh",
+      "size_bytes": 530,
+      "sha256": "87f3883571b1cd3686c8338e15210c98118754eca6f31abb9ddf1bcaf1d3ec14"
+    },
+    {
+      "path": "scripts/03_run_training_clearml.sh",
+      "size_bytes": 1475,
+      "sha256": "945a60ad67a86b2cebf85f93bd0c32f2215df39d79e768ef6ca17a42a5382108"
+    },
+    {
+      "path": "scripts/04_run_analysis_clearml.sh",
+      "size_bytes": 1163,
+      "sha256": "6ea41242c8d40373b29dacc4aad68659ff1ae331d05064fc957adde6aff51601"
+    },
+    {
+      "path": "scripts/05_cleanup_intermediates_after_success.sh",
+      "size_bytes": 883,
+      "sha256": "8f249de06d1766940e39261f06456c69ec70f52226752e7dd53e3d76c468c7d7"
+    },
+    {
+      "path": "scripts/run_pipeline_until_training_submission.sh",
+      "size_bytes": 306,
+      "sha256": "8c5b0bd3851f0b17724e3c85d7e1152a8ad8f86ca95806794d5f1690e305ef74"
+    }
+  ]
+}
