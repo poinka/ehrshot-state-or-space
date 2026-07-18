@@ -19,4 +19,4 @@ python final_exps/01_build_sequence_datasets.py \
   --rebuild \
   --rebuild-cache \
   --enable-clearml \
-  "${REMOTE_ARGS[@]}"
+  ${REMOTE_ARGS[@]+"${REMOTE_ARGS[@]}"}

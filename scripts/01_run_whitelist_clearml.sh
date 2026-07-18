@@ -18,4 +18,4 @@ PYTHONUNBUFFERED=1 python final_exps/00_build_train_only_persistent_whitelist.py
   --expected-code-count 239 \
   --overwrite \
   --enable-clearml \
-  "${REMOTE_ARGS[@]}"
+  ${REMOTE_ARGS[@]+"${REMOTE_ARGS[@]}"}

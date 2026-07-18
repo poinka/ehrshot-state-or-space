@@ -24,4 +24,4 @@ PYTHONUNBUFFERED=1 python final_exps/03_analyze_state_or_space.py \
   --n-bootstrap 10000 \
   --bootstrap-seed 42 \
   --enable-clearml \
-  "${REMOTE_ARGS[@]}"
+  ${REMOTE_ARGS[@]+"${REMOTE_ARGS[@]}"}
