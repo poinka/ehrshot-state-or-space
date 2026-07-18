@@ -1,0 +1,98 @@
+{
+  "run_set": "state_or_space_v1_core_4096",
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "runs": [
+    {
+      "task": "guo_readmission",
+      "model_family": "numeric_sequence",
+      "model_name": "RETAIN_lite_numeric",
+      "base_model_name": "RETAIN_lite",
+      "representation": "raw",
+      "compression_version": "raw_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_readmission",
+      "model_family": "numeric_sequence",
+      "model_name": "RETAIN_lite_numeric",
+      "base_model_name": "RETAIN_lite",
+      "representation": "condition_era_backfill",
+      "compression_version": "condition_era_90_backfill_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_readmission",
+      "model_family": "numeric_sequence",
+      "model_name": "RETAIN_lite_numeric",
+      "base_model_name": "RETAIN_lite",
+      "representation": "condition_era_no_backfill",
+      "compression_version": "condition_era_90_no_backfill_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_readmission",
+      "model_family": "numeric_sequence",
+      "model_name": "RETAIN_lite_numeric",
+      "base_model_name": "RETAIN_lite",
+      "representation": "condition_era_structure_null",
+      "compression_version": "condition_era_90_structure_null_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_icu",
+      "model_family": "numeric_sequence",
+      "model_name": "GRU_2L_numeric",
+      "base_model_name": "GRU_2L",
+      "representation": "raw",
+      "compression_version": "raw_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_icu",
+      "model_family": "numeric_sequence",
+      "model_name": "GRU_2L_numeric",
+      "base_model_name": "GRU_2L",
+      "representation": "condition_era_backfill",
+      "compression_version": "condition_era_90_backfill_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_icu",
+      "model_family": "numeric_sequence",
+      "model_name": "GRU_2L_numeric",
+      "base_model_name": "GRU_2L",
+      "representation": "condition_era_no_backfill",
+      "compression_version": "condition_era_90_no_backfill_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    },
+    {
+      "task": "guo_icu",
+      "model_family": "numeric_sequence",
+      "model_name": "GRU_2L_numeric",
+      "base_model_name": "GRU_2L",
+      "representation": "condition_era_structure_null",
+      "compression_version": "condition_era_90_structure_null_4096",
+      "numeric_on": true,
+      "max_len": 4096,
+      "batch_size": 8
+    }
+  ]
+}
