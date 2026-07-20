@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 """
@@ -38,16 +37,69 @@ def parse_args() -> argparse.Namespace:
         "--predictions",
         type=Path,
         default=Path(
-            "ehrshot_state_or_space_final_sequence_results/"
+            "ehrshot_state_or_space_final_sequence_results/combined/"
             "sequence_multiseed_heldout_predictions.csv"
+        ),
+        help=(
+            "Path to the combined prediction CSV. By default this file is "
+            "rebuilt from --prediction-run-tags before analysis."
         ),
     )
     parser.add_argument(
         "--predictions-s3-url",
         default=(
-            f"{S3_BASE}/ehrshot_state_or_space_final_sequence_results/"
+            f"{S3_BASE}/ehrshot_state_or_space_final_sequence_results/combined/"
             "sequence_multiseed_heldout_predictions.csv"
         ),
+        help=(
+            "Legacy single-file fallback used only when --prediction-run-tags "
+            "is empty."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-run-tags",
+        default="core_4096,context_16384,icu_gap_extra_30_180",
+        help=(
+            "Comma-separated training result folders to merge before analysis. "
+            "Pass an empty string to use --predictions/--predictions-s3-url directly."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-results-dir",
+        type=Path,
+        default=Path("ehrshot_state_or_space_final_sequence_results"),
+        help="Local root containing one folder per training run tag.",
+    )
+    parser.add_argument(
+        "--prediction-results-s3-root",
+        default=(
+            f"{S3_BASE}/ehrshot_state_or_space_final_sequence_results"
+        ),
+        help="MinIO/S3 root containing one folder per training run tag.",
+    )
+    parser.add_argument(
+        "--prediction-filename",
+        default="sequence_multiseed_heldout_predictions.csv",
+    )
+    parser.add_argument(
+        "--combined-predictions-s3-url",
+        default=(
+            f"{S3_BASE}/ehrshot_state_or_space_final_sequence_results/combined/"
+            "sequence_multiseed_heldout_predictions.csv"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-combined-predictions",
+        action="store_true",
+        help=(
+            "Reuse an existing --predictions file instead of rebuilding it from "
+            "the split training runs."
+        ),
+    )
+    parser.add_argument(
+        "--skip-combined-upload",
+        action="store_true",
+        help="Do not upload the rebuilt combined prediction CSV to object storage.",
     )
     parser.add_argument(
         "--sequence-data-dir",
@@ -122,9 +174,9 @@ def maybe_init_clearml(args: argparse.Namespace):
     }
     connected = dict(task.connect(cfg))
 
-    path_keys = {"predictions", "sequence_data_dir", "analysis_config", "output_dir"}
+    path_keys = {"predictions", "prediction_results_dir", "sequence_data_dir", "analysis_config", "output_dir"}
     int_keys = {"n_bootstrap", "bootstrap_seed"}
-    bool_keys = {"skip_upload"}
+    bool_keys = {"skip_upload", "reuse_combined_predictions", "skip_combined_upload"}
     for key, value in connected.items():
         if not hasattr(args, key) or key in {"enable_clearml", "execute_remotely"}:
             continue
@@ -179,6 +231,246 @@ def upload_tree(local_root: Path, remote_prefix: str) -> pd.DataFrame:
         rows.append({"local_path": str(path), "remote_url": remote})
     return pd.DataFrame(rows)
 
+
+
+def parse_run_tags(value: str) -> list[str]:
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def expected_task_versions(config: dict[str, Any]) -> set[tuple[str, str]]:
+    expected: set[tuple[str, str]] = set()
+    for comparison in config.get("paired_comparisons", []):
+        task = str(comparison["task"])
+        expected.add((task, str(comparison["model_a"])))
+        expected.add((task, str(comparison["model_b"])))
+    return expected
+
+
+def resolve_cached_file(cached_path: Path, filename: str) -> Path:
+    cached_path = Path(cached_path)
+    if cached_path.is_file():
+        return cached_path
+    if cached_path.is_dir():
+        matches = sorted(cached_path.rglob(filename))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"Expected exactly one {filename!r} under {cached_path}, "
+                f"found {len(matches)}: {matches}"
+            )
+        return matches[0]
+    raise FileNotFoundError(cached_path)
+
+
+def load_prediction_run(
+    run_tag: str,
+    local_root: Path,
+    remote_root: str,
+    filename: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    local_path = Path(local_root) / run_tag / filename
+    remote_url = f"{remote_root.rstrip('/')}/{run_tag}/{filename}" if remote_root else ""
+
+    source = "local"
+    if not local_path.exists():
+        if not remote_url:
+            raise FileNotFoundError(local_path)
+        from clearml import StorageManager
+        import shutil
+
+        print(f"Downloading prediction run: {remote_url}")
+        cached_value = StorageManager.get_local_copy(remote_url=remote_url)
+        if not cached_value:
+            raise FileNotFoundError(f"StorageManager returned no path for {remote_url}")
+        cached = resolve_cached_file(Path(cached_value), filename)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cached, local_path)
+        source = "s3"
+
+    frame = pd.read_csv(local_path)
+    frame["source_run_tag"] = run_tag
+    return frame, {
+        "run_tag": run_tag,
+        "source": source,
+        "local_path": str(local_path),
+        "remote_url": remote_url,
+        "n_rows": int(len(frame)),
+    }
+
+
+def assert_duplicate_predictions_consistent(
+    frame: pd.DataFrame,
+    duplicate_key: list[str],
+) -> None:
+    duplicated = frame[frame.duplicated(duplicate_key, keep=False)]
+    if duplicated.empty:
+        return
+
+    value_columns = [
+        column
+        for column in ["y_true", "pred_proba", "logit"]
+        if column in duplicated.columns
+    ]
+    conflicts: list[dict[str, Any]] = []
+    for key, part in duplicated.groupby(duplicate_key, dropna=False, sort=False):
+        for column in value_columns:
+            values = part[column].dropna().to_numpy()
+            if len(values) <= 1:
+                continue
+            if column in {"pred_proba", "logit"}:
+                consistent = bool(np.allclose(values, values[0], rtol=1e-9, atol=1e-12))
+            else:
+                consistent = len(pd.unique(values)) == 1
+            if not consistent:
+                key_tuple = key if isinstance(key, tuple) else (key,)
+                conflicts.append(
+                    {
+                        **dict(zip(duplicate_key, key_tuple)),
+                        "conflicting_column": column,
+                        "source_run_tags": sorted(part["source_run_tag"].astype(str).unique()),
+                    }
+                )
+                break
+        if len(conflicts) >= 10:
+            break
+
+    if conflicts:
+        raise ValueError(
+            "The split training runs contain conflicting duplicate predictions. "
+            "Do not silently choose one retrain. Examples: "
+            f"{conflicts}"
+        )
+
+
+def merge_prediction_runs(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> tuple[Path, pd.DataFrame]:
+    run_tags = parse_run_tags(args.prediction_run_tags)
+    if not run_tags:
+        raise ValueError("merge_prediction_runs requires at least one run tag")
+
+    frames: list[pd.DataFrame] = []
+    manifest_rows: list[dict[str, Any]] = []
+    for run_tag in run_tags:
+        frame, manifest = load_prediction_run(
+            run_tag=run_tag,
+            local_root=args.prediction_results_dir,
+            remote_root=args.prediction_results_s3_root,
+            filename=args.prediction_filename,
+        )
+        print(f"Loaded {run_tag}: {len(frame)} rows")
+        frames.append(frame)
+        manifest_rows.append(manifest)
+
+    combined = pd.concat(frames, ignore_index=True)
+    duplicate_key = [
+        "task",
+        "model_name",
+        "compression_version",
+        "calibration",
+        "seed",
+        "split",
+        "example_id",
+        "subject_id",
+    ]
+    missing_duplicate_columns = [
+        column for column in duplicate_key if column not in combined.columns
+    ]
+    if missing_duplicate_columns:
+        raise ValueError(
+            "Cannot safely merge prediction runs; missing key columns: "
+            f"{missing_duplicate_columns}"
+        )
+
+    assert_duplicate_predictions_consistent(combined, duplicate_key)
+    before = len(combined)
+    combined = combined.drop_duplicates(duplicate_key, keep="first").reset_index(drop=True)
+    removed = before - len(combined)
+
+    required_pairs = expected_task_versions(config)
+    actual_pairs = set(
+        combined[["task", "compression_version"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    )
+    missing_pairs = required_pairs - actual_pairs
+    if missing_pairs:
+        raise ValueError(
+            "Combined predictions are missing task/version pairs required by "
+            f"the analysis config: {sorted(missing_pairs)}"
+        )
+
+    expected_seeds = sorted(int(seed) for seed in config["seeds"])
+    calibrated = combined[
+        (combined["split"] == "held_out")
+        & (combined["calibration"] == "platt")
+    ]
+    for pair in sorted(required_pairs):
+        task, version = pair
+        part = calibrated[
+            (calibrated["task"] == task)
+            & (calibrated["compression_version"] == version)
+        ]
+        seeds = sorted(part["seed"].astype(int).unique().tolist())
+        if seeds != expected_seeds:
+            raise ValueError(
+                f"{task}/{version}: expected seeds {expected_seeds}, got {seeds}"
+            )
+
+    args.predictions.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(args.predictions, index=False)
+
+    manifest_rows.append(
+        {
+            "run_tag": "__combined__",
+            "source": "generated",
+            "local_path": str(args.predictions),
+            "remote_url": args.combined_predictions_s3_url,
+            "n_rows": int(len(combined)),
+            "n_duplicate_rows_removed": int(removed),
+            "required_task_version_pairs": int(len(required_pairs)),
+        }
+    )
+    manifest = pd.DataFrame(manifest_rows)
+
+    if not args.skip_combined_upload and args.combined_predictions_s3_url:
+        from clearml import StorageManager
+
+        print(f"Uploading combined predictions: {args.combined_predictions_s3_url}")
+        StorageManager.upload_file(
+            local_file=str(args.predictions),
+            remote_url=args.combined_predictions_s3_url,
+            wait_for_upload=True,
+        )
+
+    print(
+        "Combined prediction runs: "
+        f"tags={run_tags}, rows={len(combined)}, duplicates_removed={removed}"
+    )
+    return args.predictions, manifest
+
+
+def prepare_predictions(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> tuple[Path, pd.DataFrame]:
+    run_tags = parse_run_tags(args.prediction_run_tags)
+    if run_tags and not args.reuse_combined_predictions:
+        return merge_prediction_runs(args, config)
+
+    path = download_if_missing(args.predictions, args.predictions_s3_url)
+    manifest = pd.DataFrame(
+        [
+            {
+                "run_tag": "__combined_reused__",
+                "source": "existing",
+                "local_path": str(path),
+                "remote_url": args.predictions_s3_url,
+                "n_rows": None,
+            }
+        ]
+    )
+    return path, manifest
 
 def load_config(path: Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as f:
@@ -548,8 +840,8 @@ def main() -> None:
     task = maybe_init_clearml(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    predictions_path = download_if_missing(args.predictions, args.predictions_s3_url)
     config = load_config(args.analysis_config)
+    predictions_path, prediction_merge_manifest = prepare_predictions(args, config)
     pred = pd.read_csv(predictions_path)
     pred = validate_predictions(pred, expected_seeds=[int(x) for x in config["seeds"]])
 
@@ -606,6 +898,7 @@ def main() -> None:
         "context_interaction_bootstrap.csv": context,
         "last_episode_ensemble_metrics.csv": last_episode_metrics,
         "last_episode_paired_bootstrap_deltas.csv": last_episode_paired,
+        "prediction_merge_manifest.csv": prediction_merge_manifest,
     }
     for filename, frame in outputs.items():
         frame.to_csv(args.output_dir / filename, index=False)
@@ -617,6 +910,10 @@ def main() -> None:
         "bootstrap_seed": args.bootstrap_seed,
         "n_prediction_rows": int(len(pred)),
         "n_ensemble_rows": int(len(ens)),
+        "prediction_run_tags": parse_run_tags(args.prediction_run_tags),
+        "prediction_results_dir": str(args.prediction_results_dir),
+        "prediction_results_s3_root": args.prediction_results_s3_root,
+        "combined_predictions_s3_url": args.combined_predictions_s3_url,
     }
     with (args.output_dir / "resolved_analysis_config.json").open("w", encoding="utf-8") as f:
         json.dump(resolved, f, ensure_ascii=False, indent=2)
@@ -630,6 +927,10 @@ def main() -> None:
         for name, frame in outputs.items():
             task.upload_artifact(name.removesuffix(".csv"), frame)
         task.upload_artifact("resolved_analysis_config", resolved)
+        task.upload_artifact(
+            "combined_predictions",
+            artifact_object=str(predictions_path),
+        )
         if len(upload_manifest):
             task.upload_artifact("analysis_upload_manifest", upload_manifest)
 
