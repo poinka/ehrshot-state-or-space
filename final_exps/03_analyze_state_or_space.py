@@ -16,6 +16,8 @@ Main outputs:
     - ensemble_predictions.csv
     - ensemble_metrics.csv
     - paired_patient_bootstrap_deltas.csv
+    - equal_patient_weight_ensemble_metrics.csv
+    - equal_patient_weight_paired_bootstrap_deltas.csv
     - paired_history_coverage_deltas.csv
     - context_interaction_bootstrap.csv
     - last_episode_ensemble_metrics.csv
@@ -31,6 +33,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 
 from common_ehrshot_eval import binary_ranking_metrics, topk_metrics
 
@@ -47,6 +50,9 @@ PREDICTIVE_METRICS = [
     "logloss",
     "top_10pct_precision",
 ]
+
+LOWER_IS_BETTER_METRICS = {"brier", "logloss"}
+DIRECTION_TOL = 1e-12
 
 HISTORY_METRICS = [
     "earliest_retained_days_before_prediction",
@@ -585,6 +591,238 @@ def metric_bundle(y: np.ndarray, p: np.ndarray, tie: np.ndarray) -> dict[str, fl
     }
 
 
+
+def patient_equal_episode_weights(df: pd.DataFrame) -> np.ndarray:
+    """Give every patient total weight 1, split equally across that patient's episodes."""
+    counts = df.groupby("subject_id")["row_id"].transform("size").to_numpy(dtype=float)
+    if np.any(counts <= 0):
+        raise ValueError("Invalid episode count while building equal-patient weights")
+    weights = 1.0 / counts
+
+    check = pd.DataFrame(
+        {
+            "subject_id": df["subject_id"].to_numpy(),
+            "weight": weights,
+        }
+    ).groupby("subject_id", sort=False)["weight"].sum()
+    if not np.allclose(check.to_numpy(dtype=float), 1.0, rtol=1e-12, atol=1e-12):
+        raise ValueError("Equal-patient weights do not sum to 1 within every subject")
+    return weights
+
+
+def weighted_top_fraction_metrics(
+    y: np.ndarray,
+    p: np.ndarray,
+    sample_weight: np.ndarray,
+    tie: np.ndarray,
+    frac: float = 0.10,
+) -> dict[str, float]:
+    """
+    Weighted top-fraction metrics.
+
+    Episodes are sorted by risk. The boundary episode may contribute a fractional
+    amount of its weight so the selected group has exactly `frac` of total weight.
+    """
+    y = np.asarray(y, dtype=int)
+    p = np.asarray(p, dtype=float)
+    w = np.asarray(sample_weight, dtype=float)
+    tie = np.asarray(tie)
+
+    if not (len(y) == len(p) == len(w) == len(tie)):
+        raise ValueError("Weighted top-k arrays have inconsistent lengths")
+    if len(y) == 0 or not np.isfinite(w).all() or np.any(w < 0):
+        return {
+            "top_10pct_precision": np.nan,
+            "top_10pct_lift": np.nan,
+            "top_10pct_event_capture": np.nan,
+        }
+
+    total_weight = float(w.sum())
+    if total_weight <= 0:
+        return {
+            "top_10pct_precision": np.nan,
+            "top_10pct_lift": np.nan,
+            "top_10pct_event_capture": np.nan,
+        }
+
+    # Primary key: descending risk. Secondary key: deterministic row/tie id.
+    order = np.lexsort((tie, -p))
+    target_weight = float(frac * total_weight)
+    remaining = target_weight
+    selected_positive_weight = 0.0
+
+    for idx in order:
+        if remaining <= 0:
+            break
+        take = min(float(w[idx]), remaining)
+        selected_positive_weight += take * float(y[idx])
+        remaining -= take
+
+    selected_weight = target_weight - max(remaining, 0.0)
+    positive_weight = float(np.sum(w * y))
+    base_rate = positive_weight / total_weight if total_weight > 0 else np.nan
+    precision = (
+        selected_positive_weight / selected_weight
+        if selected_weight > 0
+        else np.nan
+    )
+    lift = precision / base_rate if np.isfinite(base_rate) and base_rate > 0 else np.nan
+    capture = (
+        selected_positive_weight / positive_weight
+        if positive_weight > 0
+        else np.nan
+    )
+    return {
+        "top_10pct_precision": float(precision),
+        "top_10pct_lift": float(lift),
+        "top_10pct_event_capture": float(capture),
+    }
+
+
+def metric_bundle_equal_patient_weight(
+    y: np.ndarray,
+    p: np.ndarray,
+    tie: np.ndarray,
+    sample_weight: np.ndarray,
+) -> dict[str, float]:
+    """Predictive metrics where each patient's episodes have total weight 1."""
+    y = np.asarray(y, dtype=int)
+    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
+    w = np.asarray(sample_weight, dtype=float)
+    tie = np.asarray(tie)
+
+    if not (len(y) == len(p) == len(w) == len(tie)):
+        raise ValueError("Weighted metric arrays have inconsistent lengths")
+    if len(y) == 0 or w.sum() <= 0:
+        return {
+            "auroc": np.nan,
+            "auprc": np.nan,
+            "brier": np.nan,
+            "logloss": np.nan,
+            "top_10pct_precision": np.nan,
+            "top_10pct_lift": np.nan,
+            "top_10pct_event_capture": np.nan,
+            "n": int(len(y)),
+            "n_positive": int(y.sum()),
+            "event_rate": np.nan,
+            "total_weight": float(w.sum()),
+        }
+
+    positive_weight = float(w[y == 1].sum())
+    negative_weight = float(w[y == 0].sum())
+    if positive_weight > 0 and negative_weight > 0:
+        auroc = float(roc_auc_score(y, p, sample_weight=w))
+        auprc = float(average_precision_score(y, p, sample_weight=w))
+    else:
+        auroc = np.nan
+        auprc = np.nan
+
+    brier = float(np.average((y - p) ** 2, weights=w))
+    logloss_value = float(log_loss(y, p, sample_weight=w, labels=[0, 1]))
+    top = weighted_top_fraction_metrics(y, p, w, tie, frac=0.10)
+
+    return {
+        "auroc": auroc,
+        "auprc": auprc,
+        "brier": brier,
+        "logloss": logloss_value,
+        **top,
+        "n": int(len(y)),
+        "n_positive": int(y.sum()),
+        "event_rate": float(positive_weight / w.sum()),
+        "total_weight": float(w.sum()),
+    }
+
+
+def bootstrap_direction_fields(
+    raw_deltas: np.ndarray,
+    point_raw_delta: float,
+    higher_is_better: bool,
+    tol: float = DIRECTION_TOL,
+) -> dict[str, float | str]:
+    """Summarize how often bootstrap replicates preserve the point-estimate direction."""
+    raw_deltas = np.asarray(raw_deltas, dtype=float)
+    raw_deltas = raw_deltas[np.isfinite(raw_deltas)]
+    benefit = raw_deltas if higher_is_better else -raw_deltas
+    point_benefit = point_raw_delta if higher_is_better else -point_raw_delta
+
+    a_better = benefit > tol
+    b_better = benefit < -tol
+    equal = ~(a_better | b_better)
+
+    if point_benefit > tol:
+        matching = a_better
+    elif point_benefit < -tol:
+        matching = b_better
+    else:
+        matching = equal
+
+    return {
+        "point_effect_direction": direction_label(point_benefit, tol=tol),
+        "fraction_bootstrap_model_a_better": float(np.mean(a_better)),
+        "fraction_bootstrap_model_b_better": float(np.mean(b_better)),
+        "fraction_bootstrap_equal": float(np.mean(equal)),
+        "fraction_bootstrap_matching_point_direction": float(np.mean(matching)),
+    }
+
+
+
+def bootstrap_signed_direction_fields(
+    raw_values: np.ndarray,
+    point_value: float,
+    tol: float = DIRECTION_TOL,
+) -> dict[str, float | str]:
+    """Direction summary for quantities that are not naturally model-A-better metrics."""
+    raw_values = np.asarray(raw_values, dtype=float)
+    raw_values = raw_values[np.isfinite(raw_values)]
+    positive = raw_values > tol
+    negative = raw_values < -tol
+    equal = ~(positive | negative)
+
+    if point_value > tol:
+        matching = positive
+        point_direction = "positive"
+    elif point_value < -tol:
+        matching = negative
+        point_direction = "negative"
+    else:
+        matching = equal
+        point_direction = "equal"
+
+    return {
+        "point_delta_direction": point_direction,
+        "fraction_bootstrap_delta_positive": float(np.mean(positive)),
+        "fraction_bootstrap_delta_negative": float(np.mean(negative)),
+        "fraction_bootstrap_delta_equal": float(np.mean(equal)),
+        "fraction_bootstrap_matching_point_direction": float(np.mean(matching)),
+    }
+
+
+def equal_patient_weight_ensemble_metrics(ens: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    group_cols = [
+        "task", "model", "model_family", "representation", "compression_version",
+        "max_len", "era_gap", "numeric_on",
+    ]
+    for key, part in ens.groupby(group_cols, dropna=False):
+        row = dict(zip(group_cols, key))
+        weights = patient_equal_episode_weights(part)
+        row.update(
+            metric_bundle_equal_patient_weight(
+                part["y_true"].to_numpy(),
+                part["risk_calibrated"].to_numpy(),
+                part["row_id"].to_numpy(),
+                weights,
+            )
+        )
+        row["n_patients"] = int(part["subject_id"].nunique())
+        row["n_seeds"] = int(part["n_seeds"].min())
+        row["calibration"] = "platt"
+        row["weighting"] = "equal_total_weight_per_subject"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def metrics_by_seed(pred: pd.DataFrame) -> pd.DataFrame:
     rows = []
     group_cols = [
@@ -743,6 +981,7 @@ def paired_bootstrap(
         values = np.asarray(boot[metric], dtype=float)
         values = values[np.isfinite(values)]
         raw_delta = point_a[metric] - point_b[metric]
+        higher_is_better = metric not in LOWER_IS_BETTER_METRICS
         rows.append(
             {
                 "comparison": comparison_name,
@@ -750,24 +989,105 @@ def paired_bootstrap(
                 "model_a": model_a,
                 "model_b": model_b,
                 "metric": metric,
-                "higher_is_better": metric not in {"brier", "logloss"},
+                "higher_is_better": higher_is_better,
                 "model_a_value": point_a[metric],
                 "model_b_value": point_b[metric],
                 "point_delta_a_minus_b": raw_delta,
-                "benefit_delta": raw_delta if metric not in {"brier", "logloss"} else -raw_delta,
+                "benefit_delta": raw_delta if higher_is_better else -raw_delta,
                 "bootstrap_mean_delta": float(values.mean()),
                 "bootstrap_std_delta": float(values.std(ddof=1)),
                 "ci_low": float(np.quantile(values, 0.025)),
                 "ci_high": float(np.quantile(values, 0.975)),
+                **bootstrap_direction_fields(values, raw_delta, higher_is_better),
                 "n_bootstrap_valid": int(len(values)),
                 "n_bootstrap_requested": int(n_bootstrap),
                 "bootstrap_unit": "subject_id",
+                "weighting": "episode_weighted_with_patient_cluster_resampling",
                 "n_paired_examples": int(len(merged)),
                 "n_paired_patients": int(merged["subject_id"].nunique()),
                 "n_paired_positive": int(merged["y_true"].sum()),
             }
         )
     return pd.DataFrame(rows)
+
+
+def paired_bootstrap_equal_patient_weight(
+    merged: pd.DataFrame,
+    comparison_name: str,
+    task: str,
+    model_a: str,
+    model_b: str,
+    n_bootstrap: int,
+    seed: int,
+) -> pd.DataFrame:
+    """
+    Paired patient-cluster bootstrap with equal total patient weight.
+
+    Every patient has total weight 1, split over their episodes. Patients are
+    sampled with replacement and all episodes from each selected patient enter
+    the replicate together. If a patient is sampled twice, their total weight is 2.
+    """
+    y = merged["y_true"].to_numpy(dtype=int)
+    pa = merged["pred_a"].to_numpy(dtype=float)
+    pb = merged["pred_b"].to_numpy(dtype=float)
+    tie = merged["row_id"].to_numpy(dtype=int)
+    base_weight = patient_equal_episode_weights(merged)
+    groups = cluster_groups(merged)
+    rng = np.random.default_rng(seed)
+
+    point_a = metric_bundle_equal_patient_weight(y, pa, tie, base_weight)
+    point_b = metric_bundle_equal_patient_weight(y, pb, tie, base_weight)
+    boot = {metric: [] for metric in PREDICTIVE_METRICS}
+
+    for _ in range(n_bootstrap):
+        sampled = rng.integers(0, len(groups), size=len(groups))
+        idx = np.concatenate([groups[i] for i in sampled])
+        sample_tie = np.arange(len(idx), dtype=np.int64)
+        sample_weight = base_weight[idx]
+        ma = metric_bundle_equal_patient_weight(
+            y[idx], pa[idx], sample_tie, sample_weight
+        )
+        mb = metric_bundle_equal_patient_weight(
+            y[idx], pb[idx], sample_tie, sample_weight
+        )
+        for metric in PREDICTIVE_METRICS:
+            boot[metric].append(ma[metric] - mb[metric])
+
+    rows = []
+    for metric in PREDICTIVE_METRICS:
+        values = np.asarray(boot[metric], dtype=float)
+        values = values[np.isfinite(values)]
+        raw_delta = point_a[metric] - point_b[metric]
+        higher_is_better = metric not in LOWER_IS_BETTER_METRICS
+        rows.append(
+            {
+                "comparison": comparison_name,
+                "task": task,
+                "model_a": model_a,
+                "model_b": model_b,
+                "metric": metric,
+                "higher_is_better": higher_is_better,
+                "model_a_value": point_a[metric],
+                "model_b_value": point_b[metric],
+                "point_delta_a_minus_b": raw_delta,
+                "benefit_delta": raw_delta if higher_is_better else -raw_delta,
+                "bootstrap_mean_delta": float(values.mean()),
+                "bootstrap_std_delta": float(values.std(ddof=1)),
+                "ci_low": float(np.quantile(values, 0.025)),
+                "ci_high": float(np.quantile(values, 0.975)),
+                **bootstrap_direction_fields(values, raw_delta, higher_is_better),
+                "n_bootstrap_valid": int(len(values)),
+                "n_bootstrap_requested": int(n_bootstrap),
+                "bootstrap_unit": "subject_id",
+                "weighting": "equal_total_weight_per_subject",
+                "n_paired_examples": int(len(merged)),
+                "n_paired_patients": int(merged["subject_id"].nunique()),
+                "n_paired_positive": int(merged["y_true"].sum()),
+                "total_patient_weight": float(base_weight.sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
 
 
 def run_comparisons(
@@ -787,6 +1107,36 @@ def run_comparisons(
         )
         rows.append(
             paired_bootstrap(
+                merged,
+                str(cfg["name"]),
+                task,
+                a_version,
+                b_version,
+                n_bootstrap,
+                seed,
+            )
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+
+def run_comparisons_equal_patient_weight(
+    ens: pd.DataFrame,
+    config: dict[str, Any],
+    n_bootstrap: int,
+    seed: int,
+) -> pd.DataFrame:
+    rows = []
+    for cfg in config["paired_comparisons"]:
+        task = str(cfg["task"])
+        a_version = str(cfg["model_a"])
+        b_version = str(cfg["model_b"])
+        merged = paired_prediction_merge(
+            select_version(ens, task, a_version),
+            select_version(ens, task, b_version),
+        )
+        rows.append(
+            paired_bootstrap_equal_patient_weight(
                 merged,
                 str(cfg["name"]),
                 task,
@@ -1001,6 +1351,10 @@ def history_bootstrap_rows(
                 "bootstrap_std_delta": float(values_arr.std(ddof=1)),
                 "ci_low": float(np.quantile(values_arr, 0.025)),
                 "ci_high": float(np.quantile(values_arr, 0.975)),
+                **bootstrap_signed_direction_fields(
+                    values_arr,
+                    float(np.mean(delta)),
+                ),
                 "fraction_delta_positive": float(np.mean(delta > 0)),
                 "fraction_delta_zero": float(np.mean(np.isclose(delta, 0.0))),
                 "fraction_delta_negative": float(np.mean(delta < 0)),
@@ -1121,9 +1475,16 @@ def context_interaction_bootstrap(
                 "bootstrap_std": float(values.std(ddof=1)),
                 "ci_low": float(np.quantile(values, 0.025)),
                 "ci_high": float(np.quantile(values, 0.975)),
+                **bootstrap_signed_direction_fields(
+                    values,
+                    point[metric],
+                ),
                 "n_bootstrap_valid": int(len(values)),
+                "n_bootstrap_requested": int(n_bootstrap),
+                "bootstrap_unit": "subject_id",
                 "n_examples": int(len(merged)),
                 "n_patients": int(merged["subject_id"].nunique()),
+                "n_positive": int(merged["y_true"].sum()),
             }
         )
     return pd.DataFrame(rows)
@@ -1153,6 +1514,13 @@ def main() -> None:
     ens = make_ensemble(pred)
     ens_metrics = ensemble_metrics(ens)
     paired = run_comparisons(
+        ens,
+        config,
+        n_bootstrap=args.n_bootstrap,
+        seed=args.bootstrap_seed,
+    )
+    equal_patient_metrics = equal_patient_weight_ensemble_metrics(ens)
+    equal_patient_paired = run_comparisons_equal_patient_weight(
         ens,
         config,
         n_bootstrap=args.n_bootstrap,
@@ -1202,6 +1570,8 @@ def main() -> None:
         "ensemble_predictions.csv": ens,
         "ensemble_metrics.csv": ens_metrics,
         "paired_patient_bootstrap_deltas.csv": paired,
+        "equal_patient_weight_ensemble_metrics.csv": equal_patient_metrics,
+        "equal_patient_weight_paired_bootstrap_deltas.csv": equal_patient_paired,
         "paired_history_coverage_deltas.csv": history_deltas,
         "context_interaction_bootstrap.csv": context,
         "last_episode_ensemble_metrics.csv": last_episode_metrics,
@@ -1223,6 +1593,16 @@ def main() -> None:
         "n_prediction_rows": int(len(pred)),
         "n_ensemble_rows": int(len(ens)),
         "history_metrics": HISTORY_METRICS,
+        "bootstrap_direction_columns": [
+            "fraction_bootstrap_model_a_better",
+            "fraction_bootstrap_model_b_better",
+            "fraction_bootstrap_equal",
+            "fraction_bootstrap_matching_point_direction",
+        ],
+        "equal_patient_weighting": (
+            "Each subject has total weight 1, divided equally across that "
+            "subject's episodes. Top-10% is defined by cumulative patient weight."
+        ),
     }
     with (args.output_dir / "resolved_analysis_config.json").open("w", encoding="utf-8") as f:
         json.dump(resolved, f, ensure_ascii=False, indent=2)
@@ -1245,6 +1625,7 @@ def main() -> None:
     print(f"Prediction rows: {len(pred)}")
     print(f"Ensemble rows: {len(ens)}")
     print(f"Paired predictive rows: {len(paired)}")
+    print(f"Equal-patient-weight paired rows: {len(equal_patient_paired)}")
     print(f"Paired seed rows: {len(paired_seed)}")
     print(f"History delta rows: {len(history_deltas)}")
     print(f"Context interaction rows: {len(context)}")
