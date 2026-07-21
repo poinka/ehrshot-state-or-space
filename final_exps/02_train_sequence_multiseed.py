@@ -34,6 +34,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import time
 from copy import deepcopy
@@ -79,6 +80,28 @@ REQUIRED_PREDICTION_COLUMNS = [
     "y_true",
     "pred_proba",
     "logit",
+]
+
+# Article-facing wide schema: one row per example / seed / split.
+# Legacy long predictions are still written for backward compatibility and resume.
+WIDE_PREDICTION_COLUMNS = [
+    "task",
+    "representation",
+    "compression_version",
+    "max_len",
+    "era_gap",
+    "model",
+    "model_family",
+    "numeric_on",
+    "seed",
+    "split",
+    "row_id",
+    "subject_id",
+    "prediction_time",
+    "y_true",
+    "logit",
+    "risk_raw",
+    "risk_calibrated",
 ]
 
 DEFAULT_CHECKPOINT_S3_PREFIX = (
@@ -324,7 +347,11 @@ def try_restore_complete_run_from_remote(
     seed: int,
     args: argparse.Namespace,
 ) -> bool:
-    if not args.checkpoint_s3_prefix or not args.results_s3_prefix:
+    source_results_prefix = (
+        getattr(args, "source_results_s3_prefix", "")
+        or args.results_s3_prefix
+    )
+    if not args.checkpoint_s3_prefix or not source_results_prefix:
         return False
 
     local_ckpt = build_local_checkpoint_path(
@@ -342,7 +369,7 @@ def try_restore_complete_run_from_remote(
 
     local_outputs = expected_run_output_files(run_cfg, seed, args.output_dir)
     remote_outputs = [
-        f"{args.results_s3_prefix.rstrip('/')}/{path.name}"
+        f"{source_results_prefix.rstrip('/')}/{path.name}"
         for path in local_outputs
     ]
 
@@ -546,6 +573,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--source-results-s3-prefix",
+        type=str,
+        default="",
+        help=(
+            "Source MinIO/S3 prefix with already saved legacy per-run outputs. "
+            "Used only by --export-wide-only. When empty, --results-s3-prefix is used."
+        ),
+    )
+
+    parser.add_argument(
         "--local-checkpoint-dir",
         type=Path,
         default=None,
@@ -617,6 +654,17 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Пропускать run, если checkpoint уже существует локально или в MinIO.",
+    )
+
+    parser.add_argument(
+        "--export-wide-only",
+        action="store_true",
+        help=(
+            "Только восстановить ранее сохраненные predictions через --resume и "
+            "пересобрать article-facing wide predictions. Если хотя бы один run нельзя "
+            "восстановить полностью, скрипт завершится ошибкой и НЕ начнет обучение. "
+            "В MinIO/ClearML публикуются только wide prediction CSV."
+        ),
     )
     
     parser.add_argument(
@@ -2613,6 +2661,7 @@ def sync_args_from_clearml_config(
         "no_save_checkpoints",
         "skip_checkpoint_upload",
         "resume",
+        "export_wide_only",
         "no_progress_bars",
     }
 
@@ -2691,6 +2740,7 @@ def maybe_init_clearml(args: argparse.Namespace):
     print(f"  output_dir = {args.output_dir}")
     print(f"  checkpoint_dir = {args.checkpoint_dir}")
     print(f"  results_s3_prefix = {args.results_s3_prefix}")
+    print(f"  source_results_s3_prefix = {args.source_results_s3_prefix}")
     print(f"  local_checkpoint_dir = {args.local_checkpoint_dir}")
     print(f"  device = {args.device}")
     print(f"  clearml_queue = {args.clearml_queue}")
@@ -2710,6 +2760,208 @@ def _read_csv_parts(paths: list[Path]) -> pd.DataFrame:
     if not parts:
         return pd.DataFrame()
     return pd.concat(parts, ignore_index=True).drop_duplicates().reset_index(drop=True)
+
+
+
+def parse_era_gap(compression_version: str) -> int | None:
+    """Extract condition-era gap from a version such as condition_era_90_backfill_4096."""
+    match = re.search(r"condition_era_(\d+)_", str(compression_version))
+    return int(match.group(1)) if match else None
+
+
+def build_run_cfg_lookup(run_cfgs: list[dict[str, Any]]) -> dict[tuple[str, str, str, bool], dict[str, Any]]:
+    lookup: dict[tuple[str, str, str, bool], dict[str, Any]] = {}
+    for cfg in run_cfgs:
+        key = (
+            str(cfg["task"]),
+            str(cfg["model_name"]),
+            str(cfg["compression_version"]),
+            bool(cfg["numeric_on"]),
+        )
+        if key in lookup and lookup[key] != cfg:
+            raise ValueError(f"Duplicate incompatible run config for {key}")
+        lookup[key] = dict(cfg)
+    return lookup
+
+
+def load_prediction_time_metadata(
+    sequence_data_dir: Path,
+    task: str,
+    compression_version: str,
+) -> pd.DataFrame:
+    path = Path(sequence_data_dir) / task / compression_version / "examples.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing examples parquet for wide predictions: {path}")
+
+    columns = ["row_id", "subject_id", "prediction_time", "label", "split"]
+    meta = pd.read_parquet(path, columns=columns).rename(
+        columns={"label": "y_true"}
+    )
+    meta["row_id"] = meta["row_id"].astype(int)
+    meta["subject_id"] = meta["subject_id"].astype(int)
+    meta["y_true"] = meta["y_true"].astype(int)
+    meta["split"] = meta["split"].astype(str)
+    meta["prediction_time"] = pd.to_datetime(meta["prediction_time"], errors="raise")
+    return meta.drop_duplicates(["row_id", "subject_id", "split"])
+
+
+def legacy_predictions_to_wide(
+    legacy: pd.DataFrame,
+    run_cfgs: list[dict[str, Any]],
+    sequence_data_dir: Path,
+) -> pd.DataFrame:
+    """
+    Convert legacy long predictions (raw/platt in separate rows) to the article-facing
+    wide schema. This conversion does not run a model and therefore preserves the
+    already saved logits/probabilities exactly.
+    """
+    if legacy.empty:
+        return pd.DataFrame(columns=WIDE_PREDICTION_COLUMNS)
+
+    required = set(REQUIRED_PREDICTION_COLUMNS)
+    missing = required - set(legacy.columns)
+    if missing:
+        raise ValueError(f"Legacy prediction table is missing columns: {sorted(missing)}")
+
+    legacy = legacy.copy()
+    for col in ["seed", "example_id", "subject_id", "y_true"]:
+        legacy[col] = legacy[col].astype(int)
+    legacy["numeric_on"] = legacy["numeric_on"].astype(bool)
+    legacy["pred_proba"] = legacy["pred_proba"].astype(float)
+    legacy["logit"] = legacy["logit"].astype(float)
+
+    id_without_calibration = [
+        "task", "model_family", "model_name", "representation",
+        "compression_version", "numeric_on", "seed", "split",
+        "example_id", "subject_id", "y_true",
+    ]
+
+    # The same model logit must be repeated identically in raw and Platt rows.
+    logit_counts = (
+        legacy.groupby(id_without_calibration, dropna=False)["logit"]
+        .agg(lambda s: int(np.sum(~np.isclose(s.to_numpy(float), float(s.iloc[0]), rtol=1e-9, atol=1e-12))))
+    )
+    if (logit_counts > 0).any():
+        raise ValueError("Raw/Platt rows contain conflicting logits")
+
+    pivot = legacy.pivot(
+        index=id_without_calibration + ["logit"],
+        columns="calibration",
+        values="pred_proba",
+    ).reset_index()
+    pivot.columns.name = None
+
+    for calibration in ["raw", "platt"]:
+        if calibration not in pivot.columns:
+            raise ValueError(f"Missing calibration={calibration!r} in legacy predictions")
+
+    pivot = pivot.rename(
+        columns={
+            "model_name": "model",
+            "example_id": "row_id",
+            "raw": "risk_raw",
+            "platt": "risk_calibrated",
+        }
+    )
+
+    cfg_lookup = build_run_cfg_lookup(run_cfgs)
+    max_lens: list[int] = []
+    for row in pivot[["task", "model", "compression_version", "numeric_on"]].itertuples(index=False):
+        key = (str(row.task), str(row.model), str(row.compression_version), bool(row.numeric_on))
+        if key not in cfg_lookup:
+            raise KeyError(f"No run config for prediction key={key}")
+        max_lens.append(int(cfg_lookup[key]["max_len"]))
+    pivot["max_len"] = max_lens
+    pivot["era_gap"] = pd.array(
+        [parse_era_gap(v) for v in pivot["compression_version"]],
+        dtype="Int64",
+    )
+
+    metadata_parts = []
+    for task, version in sorted(
+        set(pivot[["task", "compression_version"]].itertuples(index=False, name=None))
+    ):
+        meta = load_prediction_time_metadata(sequence_data_dir, str(task), str(version))
+        meta.insert(0, "compression_version", str(version))
+        meta.insert(0, "task", str(task))
+        metadata_parts.append(meta)
+    metadata = pd.concat(metadata_parts, ignore_index=True)
+
+    wide = pivot.merge(
+        metadata,
+        on=["task", "compression_version", "row_id", "subject_id", "split", "y_true"],
+        how="left",
+        validate="many_to_one",
+    )
+    if wide["prediction_time"].isna().any():
+        bad = wide.loc[wide["prediction_time"].isna(), [
+            "task", "compression_version", "row_id", "subject_id", "split"
+        ]].head(10)
+        raise ValueError(f"Could not attach prediction_time to some predictions:\n{bad}")
+
+    expected_raw = sigmoid_np(wide["logit"].to_numpy(float))
+    if not np.allclose(
+        expected_raw,
+        wide["risk_raw"].to_numpy(float),
+        rtol=1e-7,
+        atol=1e-9,
+    ):
+        max_abs = float(np.max(np.abs(expected_raw - wide["risk_raw"].to_numpy(float))))
+        raise ValueError(f"risk_raw != sigmoid(logit); max_abs_diff={max_abs}")
+
+    dup_key = [
+        "task", "compression_version", "model", "seed", "split", "row_id", "subject_id"
+    ]
+    if wide.duplicated(dup_key).any():
+        raise ValueError("Duplicate rows in wide predictions")
+
+    wide = wide[WIDE_PREDICTION_COLUMNS].sort_values(
+        ["task", "compression_version", "model", "seed", "split", "row_id"]
+    ).reset_index(drop=True)
+    return wide
+
+
+def write_wide_prediction_outputs(
+    output_dir: Path,
+    run_cfgs: list[dict[str, Any]],
+    sequence_data_dir: Path,
+) -> dict[str, pd.DataFrame]:
+    """Build per-run and aggregate wide prediction CSVs from saved legacy outputs."""
+    output_dir = Path(output_dir)
+    heldout_legacy = _read_csv_parts(sorted(output_dir.glob("*__heldout_predictions.csv")))
+    tuning_legacy = _read_csv_parts(sorted(output_dir.glob("*__tuning_predictions.csv")))
+
+    heldout_wide = legacy_predictions_to_wide(heldout_legacy, run_cfgs, sequence_data_dir)
+    tuning_wide = legacy_predictions_to_wide(tuning_legacy, run_cfgs, sequence_data_dir)
+    all_wide = pd.concat([tuning_wide, heldout_wide], ignore_index=True)
+
+    heldout_wide.to_csv(output_dir / "sequence_multiseed_heldout_predictions_wide.csv", index=False)
+    tuning_wide.to_csv(output_dir / "sequence_multiseed_tuning_predictions_wide.csv", index=False)
+    all_wide.to_csv(output_dir / "sequence_multiseed_predictions_wide.csv", index=False)
+
+    # Also create one wide file per run so a partial result folder remains inspectable.
+    for (task, version, model, seed, split), part in all_wide.groupby(
+        ["task", "compression_version", "model", "seed", "split"],
+        dropna=False,
+    ):
+        cfg_matches = [
+            cfg for cfg in run_cfgs
+            if cfg["task"] == task
+            and cfg["compression_version"] == version
+            and cfg["model_name"] == model
+        ]
+        if len(cfg_matches) != 1:
+            raise ValueError(
+                f"Expected one run config for {task}/{version}/{model}, got {len(cfg_matches)}"
+            )
+        stem = build_run_stem(cfg_matches[0], int(seed))
+        part.to_csv(output_dir / f"{stem}__{split}_predictions_wide.csv", index=False)
+
+    return {
+        "heldout_wide": heldout_wide,
+        "tuning_wide": tuning_wide,
+        "all_wide": all_wide,
+    }
 
 
 def rebuild_aggregates_from_per_run_files(output_dir: Path) -> dict[str, pd.DataFrame]:
@@ -2847,6 +3099,14 @@ def main() -> None:
             if should_skip_run(run_cfg, seed, args):
                 continue
 
+            if args.export_wide_only:
+                raise RuntimeError(
+                    "--export-wide-only refuses to train. Could not restore a complete "
+                    f"legacy run for task={run_cfg['task']}, "
+                    f"compression={run_cfg['compression_version']}, seed={seed}. "
+                    "Check checkpoint_s3_prefix/results_s3_prefix and rerun."
+                )
+
             (
                 result_df,
                 pred_df,
@@ -2903,6 +3163,15 @@ def main() -> None:
     history_df = aggregate_tables["history"]
     configs_df = aggregate_tables["configs"]
 
+    wide_tables = write_wide_prediction_outputs(
+        output_dir=args.output_dir,
+        run_cfgs=run_cfgs,
+        sequence_data_dir=args.sequence_data_dir,
+    )
+    heldout_wide_df = wide_tables["heldout_wide"]
+    tuning_wide_df = wide_tables["tuning_wide"]
+    all_wide_df = wide_tables["all_wide"]
+
     if results_df.empty or predictions_df.empty:
         raise RuntimeError(
             "No complete per-run metrics/predictions were found after training/resume."
@@ -2914,6 +3183,9 @@ def main() -> None:
     history_path = args.output_dir / "sequence_multiseed_history.csv"
     token_stats_path = args.output_dir / "sequence_token_numeric_stats.csv"
     configs_path = args.output_dir / "sequence_multiseed_configs.csv"
+    heldout_wide_path = args.output_dir / "sequence_multiseed_heldout_predictions_wide.csv"
+    tuning_wide_path = args.output_dir / "sequence_multiseed_tuning_predictions_wide.csv"
+    all_wide_path = args.output_dir / "sequence_multiseed_predictions_wide.csv"
 
     print("=" * 100)
     print("DONE")
@@ -2923,11 +3195,31 @@ def main() -> None:
     print(f"Saved history: {history_path}")
     print(f"Saved token numeric stats: {token_stats_path}")
     print(f"Saved configs: {configs_path}")
+    print(f"Saved held-out wide predictions: {heldout_wide_path}")
+    print(f"Saved tuning wide predictions: {tuning_wide_path}")
+    print(f"Saved all wide predictions: {all_wide_path}")
 
-    final_upload_manifest = upload_output_tree(
-        args.output_dir,
-        args.results_s3_prefix,
-    )
+    if args.export_wide_only:
+        # Migration mode must publish only the article-facing prediction schema.
+        # Legacy long prediction CSVs were restored only as an internal source.
+        wide_paths = [
+            heldout_wide_path,
+            tuning_wide_path,
+            all_wide_path,
+            *sorted(args.output_dir.glob("*__*_predictions_wide.csv")),
+        ]
+        wide_paths = list(dict.fromkeys(Path(x) for x in wide_paths if Path(x).exists()))
+        final_upload_manifest = upload_output_files(
+            wide_paths,
+            local_root=args.output_dir,
+            remote_prefix=args.results_s3_prefix,
+        )
+    else:
+        final_upload_manifest = upload_output_tree(
+            args.output_dir,
+            args.results_s3_prefix,
+        )
+
     if len(final_upload_manifest):
         final_upload_manifest.to_csv(
             args.output_dir / "results_upload_manifest.csv",
@@ -2963,12 +3255,14 @@ def main() -> None:
     )
 
     if clearml_task is not None:
-        safe_upload_artifact(clearml_task, "sequence_multiseed_results", results_df)
-        safe_upload_artifact(clearml_task, "sequence_multiseed_predictions", predictions_df)
-        safe_upload_artifact(clearml_task, "sequence_multiseed_topk", topk_df)
-        safe_upload_artifact(clearml_task, "sequence_multiseed_history", history_df)
-        # safe_upload_artifact(clearml_task, "sequence_token_numeric_stats", token_stats_df)
-        safe_upload_artifact(clearml_task, "sequence_multiseed_configs", configs_df)                    
+        if not args.export_wide_only:
+            safe_upload_artifact(clearml_task, "sequence_multiseed_results", results_df)
+            safe_upload_artifact(clearml_task, "sequence_multiseed_topk", topk_df)
+            safe_upload_artifact(clearml_task, "sequence_multiseed_history", history_df)
+            safe_upload_artifact(clearml_task, "sequence_multiseed_configs", configs_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_heldout_predictions", heldout_wide_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_tuning_predictions", tuning_wide_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_predictions", all_wide_df)
 
 
 if __name__ == "__main__":
