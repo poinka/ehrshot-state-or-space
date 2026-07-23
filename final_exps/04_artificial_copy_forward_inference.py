@@ -111,6 +111,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="S3 prefix used to download missing vocab.json files on a remote worker.",
     )
     parser.add_argument(
+        "--storage-base-s3-prefix",
+        type=str,
+        default="",
+        help=(
+            "Base S3 prefix containing EHRSHOT_MEDS and the whitelist directory. "
+            "When omitted, it is inferred as the parent of --sequence-data-s3-prefix."
+        ),
+    )
+    parser.add_argument(
+        "--ehrshot-s3-prefix",
+        type=str,
+        default="",
+        help=(
+            "Optional exact S3 prefix of the EHRSHOT_MEDS directory. "
+            "Overrides the path inferred from --storage-base-s3-prefix."
+        ),
+    )
+    parser.add_argument(
+        "--whitelist-s3-prefix",
+        type=str,
+        default="",
+        help=(
+            "Optional exact S3 prefix of the whitelist/audit directory. "
+            "Overrides the path inferred from --storage-base-s3-prefix."
+        ),
+    )
+    parser.add_argument(
+        "--sequence-cache-s3-prefix",
+        type=str,
+        default="",
+        help=(
+            "Optional S3 prefix corresponding to the sequence builder _cache directory. "
+            "The script first tries to restore cached history parts from this prefix; "
+            "otherwise it rebuilds them from EHRSHOT_MEDS."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-dir",
         type=Path,
         default=Path("checkpoints"),
@@ -541,6 +578,221 @@ def maybe_download_file(remote_url: str, local_path: Path) -> Path:
         cached_path = matches[0]
     shutil.copy2(cached_path, local_path)
     return local_path
+
+
+def _remote_join(prefix: str, *parts: str) -> str:
+    clean = [str(part).strip("/") for part in parts if str(part).strip("/")]
+    if not prefix.strip():
+        return "/".join(clean)
+    return prefix.rstrip("/") + ("/" + "/".join(clean) if clean else "")
+
+
+def _resolve_local(project_root: Path, value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else (project_root / path).resolve()
+
+
+def infer_storage_base_s3_prefix(
+    storage_base_s3_prefix: str,
+    sequence_data_s3_prefix: str,
+) -> str:
+    if storage_base_s3_prefix.strip():
+        return storage_base_s3_prefix.rstrip("/")
+    sequence_prefix = sequence_data_s3_prefix.rstrip("/")
+    if not sequence_prefix:
+        return ""
+    return sequence_prefix.rsplit("/", 1)[0]
+
+
+def ensure_builder_source_files(
+    dataset_cfg: dict[str, Any],
+    project_root: Path,
+    tasks: Iterable[str],
+    storage_base_s3_prefix: str,
+    ehrshot_s3_prefix: str,
+    whitelist_s3_prefix: str,
+) -> None:
+    """Download all files required before CachedSequenceBuilder.__init__.
+
+    CachedSequenceBuilder validates the MEDS data, split, labels and whitelist in
+    its constructor. Therefore this preflight must run before the builder object
+    is created on a clean ClearML worker.
+    """
+    paths = dataset_cfg["paths"]
+    local_ehrshot_root = _resolve_local(project_root, paths["ehrshot_root"])
+    local_whitelist = _resolve_local(project_root, paths["persistent_code_list"])
+
+    storage_base = infer_storage_base_s3_prefix(
+        storage_base_s3_prefix=storage_base_s3_prefix,
+        sequence_data_s3_prefix="",
+    )
+    if not storage_base and not ehrshot_s3_prefix.strip():
+        missing = [
+            local_ehrshot_root / "data" / "data.parquet",
+            local_ehrshot_root / "metadata" / "subject_splits.parquet",
+            local_whitelist,
+        ]
+        if any(not path.exists() for path in missing):
+            raise ValueError(
+                "Remote builder inputs are missing and no storage prefix was supplied. "
+                "Pass --storage-base-s3-prefix or --ehrshot-s3-prefix/"
+                "--whitelist-s3-prefix."
+            )
+
+    local_ehrshot_name = Path(paths["ehrshot_root"]).as_posix().strip("/")
+    remote_ehrshot_root = (
+        ehrshot_s3_prefix.rstrip("/")
+        if ehrshot_s3_prefix.strip()
+        else _remote_join(storage_base, local_ehrshot_name)
+    )
+
+    persistent_rel = Path(paths["persistent_code_list"])
+    audit_dir_rel = persistent_rel.parent.as_posix().strip("/")
+    remote_whitelist_dir = (
+        whitelist_s3_prefix.rstrip("/")
+        if whitelist_s3_prefix.strip()
+        else _remote_join(storage_base, audit_dir_rel)
+    )
+
+    required: list[tuple[Path, str, str]] = [
+        (
+            local_ehrshot_root / "data" / "data.parquet",
+            _remote_join(remote_ehrshot_root, "data", "data.parquet"),
+            "MEDS event table",
+        ),
+        (
+            local_ehrshot_root / "metadata" / "subject_splits.parquet",
+            _remote_join(
+                remote_ehrshot_root,
+                "metadata",
+                "subject_splits.parquet",
+            ),
+            "subject split table",
+        ),
+        (
+            local_whitelist,
+            _remote_join(remote_whitelist_dir, persistent_rel.name),
+            "persistent diagnosis whitelist",
+        ),
+    ]
+    for task in tasks:
+        required.append(
+            (
+                local_ehrshot_root / "labels" / str(task) / "labels.parquet",
+                _remote_join(
+                    remote_ehrshot_root,
+                    "labels",
+                    str(task),
+                    "labels.parquet",
+                ),
+                f"labels for {task}",
+            )
+        )
+
+    print("Remote input preflight:")
+    print(f"  storage_base = {storage_base or '<not set>'}")
+    print(f"  ehrshot_remote = {remote_ehrshot_root or '<not set>'}")
+    print(f"  whitelist_remote = {remote_whitelist_dir or '<not set>'}")
+
+    for local_path, remote_url, description in required:
+        if local_path.exists():
+            print(f"  reuse {description}: {local_path}")
+            continue
+        print(f"  download {description}: {remote_url} -> {local_path}")
+        try:
+            maybe_download_file(remote_url, local_path)
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"Could not restore {description}. Local path: {local_path}. "
+                f"Remote URL attempted: {remote_url}. Original error: {exc!r}"
+            ) from exc
+
+    missing_after = [
+        str(local_path)
+        for local_path, _, _ in required
+        if not local_path.exists()
+    ]
+    if missing_after:
+        raise FileNotFoundError(
+            "Builder input preflight finished with missing files: "
+            + ", ".join(missing_after)
+        )
+    print("Remote input preflight: all builder source files are available")
+
+
+def try_restore_sequence_cache(
+    builder,
+    tasks: Iterable[str],
+    sequence_data_s3_prefix: str,
+    sequence_cache_s3_prefix: str,
+) -> None:
+    """Best-effort restore of base/history caches before rebuilding them.
+
+    Missing cache objects are not fatal because the cache can be rebuilt from the
+    downloaded MEDS source files. Exact source files, in contrast, are mandatory.
+    """
+    cache_prefix = sequence_cache_s3_prefix.strip()
+    if not cache_prefix and sequence_data_s3_prefix.strip():
+        cache_prefix = _remote_join(sequence_data_s3_prefix, "_cache")
+    if not cache_prefix:
+        print("Sequence cache preflight: no remote cache prefix; rebuild if needed")
+        return
+
+    print(f"Sequence cache preflight: trying {cache_prefix}")
+
+    base_files = [
+        builder.base_cache_path,
+        builder.base_cache_metadata_path,
+    ]
+    for local_path in base_files:
+        if local_path.exists():
+            continue
+        remote_url = _remote_join(cache_prefix, local_path.name)
+        try:
+            print(f"  try cache object: {remote_url}")
+            maybe_download_file(remote_url, local_path)
+        except Exception as exc:
+            print(f"  cache object unavailable, will rebuild if needed: {exc!r}")
+
+    history_root_name = builder.history_cache_root.name
+    for task in tasks:
+        local_task_dir = builder.task_history_dir(str(task))
+        local_manifest = local_task_dir / "manifest.json"
+        remote_task_prefix = _remote_join(cache_prefix, history_root_name, str(task))
+        if not local_manifest.exists():
+            try:
+                print(
+                    f"  try history manifest: "
+                    f"{_remote_join(remote_task_prefix, 'manifest.json')}"
+                )
+                maybe_download_file(
+                    _remote_join(remote_task_prefix, "manifest.json"),
+                    local_manifest,
+                )
+            except Exception as exc:
+                print(f"  history manifest unavailable for {task}: {exc!r}")
+                continue
+
+        try:
+            manifest = json.loads(local_manifest.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"  invalid history manifest for {task}: {exc!r}")
+            continue
+
+        for raw_path in manifest.get("parts", []):
+            local_part = local_task_dir / Path(raw_path).name
+            if local_part.exists():
+                continue
+            remote_part = _remote_join(remote_task_prefix, local_part.name)
+            try:
+                print(f"  download history part: {remote_part}")
+                maybe_download_file(remote_part, local_part)
+            except Exception as exc:
+                print(
+                    f"  history part unavailable for {task}; "
+                    f"cache will be rebuilt: {exc!r}"
+                )
+                break
 
 
 def ensure_sequence_vocabs(
@@ -1229,6 +1481,20 @@ def main() -> None:
 
     dataset_config_path = args.dataset_config.resolve()
     dataset_cfg = builder_module.load_config(dataset_config_path)
+
+    storage_base_s3_prefix = infer_storage_base_s3_prefix(
+        storage_base_s3_prefix=args.storage_base_s3_prefix,
+        sequence_data_s3_prefix=args.sequence_data_s3_prefix,
+    )
+    ensure_builder_source_files(
+        dataset_cfg=dataset_cfg,
+        project_root=project_root,
+        tasks=tasks,
+        storage_base_s3_prefix=storage_base_s3_prefix,
+        ehrshot_s3_prefix=args.ehrshot_s3_prefix,
+        whitelist_s3_prefix=args.whitelist_s3_prefix,
+    )
+
     builder = builder_module.CachedSequenceBuilder(
         cfg=dataset_cfg,
         notebook_root=project_root,
@@ -1237,6 +1503,12 @@ def main() -> None:
         rebuild_cache=False,
     )
 
+    try_restore_sequence_cache(
+        builder=builder,
+        tasks=tasks,
+        sequence_data_s3_prefix=args.sequence_data_s3_prefix,
+        sequence_cache_s3_prefix=args.sequence_cache_s3_prefix,
+    )
     ensure_history_cache(builder, tasks)
     ensure_sequence_vocabs(
         sequence_data_dir=args.sequence_data_dir,
@@ -1674,6 +1946,10 @@ def main() -> None:
         "bootstrap": args.bootstrap,
         "bootstrap_seed": args.bootstrap_seed,
         "device": str(device),
+        "storage_base_s3_prefix": storage_base_s3_prefix,
+        "ehrshot_s3_prefix": args.ehrshot_s3_prefix,
+        "whitelist_s3_prefix": args.whitelist_s3_prefix,
+        "sequence_cache_s3_prefix": args.sequence_cache_s3_prefix,
         "no_training": True,
         "candidate_rule": (
             "persistent whitelist code observed in >= min_existing_visits reconstructed "
