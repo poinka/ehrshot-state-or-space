@@ -21,7 +21,6 @@ import hashlib
 import importlib.util
 import json
 import math
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -105,12 +104,6 @@ def parse_args() -> argparse.Namespace:
         default=Path("ehrshot_state_or_space_sequence_datasets"),
     )
     parser.add_argument(
-        "--sequence-data-s3-prefix",
-        type=str,
-        default="",
-        help="S3 prefix used to download missing vocab.json files on a remote worker.",
-    )
-    parser.add_argument(
         "--checkpoint-dir",
         type=Path,
         default=Path("checkpoints"),
@@ -184,227 +177,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reuse cached perturbed sequence parquet files when present.",
     )
-    parser.add_argument(
-        "--enable-clearml",
-        action="store_true",
-        help="Initialize ClearML logging for this inference-only task.",
-    )
-    parser.add_argument(
-        "--execute-remotely",
-        action="store_true",
-        help="Enqueue the task to a ClearML agent and stop the local launcher process.",
-    )
-    parser.add_argument(
-        "--clearml-queue",
-        type=str,
-        default="",
-        help="ClearML queue name or queue ID used with --execute-remotely.",
-    )
-    parser.add_argument(
-        "--clearml-docker-image",
-        type=str,
-        default="",
-        help="Optional base Docker image for the ClearML agent task.",
-    )
-    parser.add_argument(
-        "--clearml-project",
-        type=str,
-        default="pershin-medailab/EHR_Risk_Profiling/EHRSHOT",
-    )
-    parser.add_argument(
-        "--clearml-task-name",
-        type=str,
-        default="state_or_space_artificial_copy_forward_inference",
-    )
-    parser.add_argument(
-        "--clearml-output-uri",
-        type=str,
-        default="s3://api.blackhole2.ai.innopolis.university:443/pershin-medailab",
-    )
-    parser.add_argument(
-        "--clearml-tags",
-        type=str,
-        default="inference-only,copy-forward,stress-test",
-        help="Comma-separated ClearML task tags.",
-    )
-    parser.add_argument(
-        "--clearml-upload-artifacts",
-        action="store_true",
-        help="Upload output CSV/JSON files as ClearML artifacts after successful completion.",
-    )
     return parser.parse_args()
-
-
-def init_clearml_local(args: argparse.Namespace):
-    """Initialize ClearML locally or enqueue the same task to a remote agent."""
-    remote_agent_run = bool(
-        os.environ.get("CLEARML_TASK_ID")
-        or os.environ.get("TRAINS_TASK_ID")
-    )
-
-    if not args.enable_clearml and not remote_agent_run:
-        return None
-
-    from clearml import Task
-
-    if not remote_agent_run:
-        # Keep repository requirements instead of freezing the local macOS environment.
-        requirements_path = Path("requirements.txt")
-        if requirements_path.exists():
-            Task.force_requirements_env_freeze(False, str(requirements_path))
-
-        task = Task.init(
-            project_name=args.clearml_project,
-            task_name=args.clearml_task_name,
-            task_type=Task.TaskTypes.inference,
-            output_uri=args.clearml_output_uri or None,
-            auto_connect_arg_parser=False,
-            auto_connect_frameworks=False,
-        )
-
-        if args.clearml_docker_image.strip():
-            task.set_base_docker(args.clearml_docker_image.strip())
-    else:
-        task = Task.current_task()
-        if task is None:
-            task = Task.init(
-                project_name=args.clearml_project,
-                task_name=args.clearml_task_name,
-                task_type=Task.TaskTypes.inference,
-                output_uri=args.clearml_output_uri or None,
-                auto_connect_arg_parser=False,
-                auto_connect_frameworks=False,
-            )
-
-    tags = parse_csv_list(args.clearml_tags)
-    if tags:
-        task.add_tags(tags)
-
-    connected = {
-        "dataset_config": str(args.dataset_config),
-        "run_configs": [str(x) for x in args.run_config],
-        "builder_script": str(args.builder_script),
-        "trainer_script": str(args.trainer_script),
-        "sequence_data_dir": str(args.sequence_data_dir),
-        "sequence_data_s3_prefix": args.sequence_data_s3_prefix,
-        "checkpoint_dir": str(args.checkpoint_dir),
-        "checkpoint_s3_prefix": args.checkpoint_s3_prefix,
-        "baseline_predictions": str(args.baseline_predictions),
-        "baseline_predictions_s3_url": args.baseline_predictions_s3_url,
-        "output_dir": str(args.output_dir),
-        "tasks": args.tasks,
-        "compression_versions": args.compression_versions,
-        "copy_fractions": args.copy_fractions,
-        "min_existing_visits": args.min_existing_visits,
-        "selection_seed": args.selection_seed,
-        "device": args.device,
-        "num_workers": args.num_workers,
-        "batch_size": args.batch_size,
-        "baseline_logit_tolerance": args.baseline_logit_tolerance,
-        "allow_baseline_mismatch": args.allow_baseline_mismatch,
-        "bootstrap": args.bootstrap,
-        "bootstrap_seed": args.bootstrap_seed,
-        "reuse_perturbed_sequences": args.reuse_perturbed_sequences,
-        "clearml_queue": args.clearml_queue,
-        "clearml_docker_image": args.clearml_docker_image,
-        "no_training": True,
-        "execution_mode": "remote" if remote_agent_run else "local_launcher",
-    }
-    task.connect(connected, name="copy_forward_inference")
-
-    print("ClearML inference task initialized:")
-    print(f"  task_id = {task.id}")
-    print(f"  project = {args.clearml_project}")
-    print(f"  task_name = {args.clearml_task_name}")
-    print(f"  remote_agent_run = {remote_agent_run}")
-    print(f"  device = {args.device}")
-    print("  no_training = True")
-
-    if args.execute_remotely and not remote_agent_run:
-        if not args.clearml_queue.strip():
-            raise ValueError("--clearml-queue is required with --execute-remotely")
-        print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
-        task.execute_remotely(
-            queue_name=args.clearml_queue.strip(),
-            exit_process=True,
-        )
-
-    return task
-
-
-def upload_clearml_outputs(task, output_dir: Path) -> None:
-    """Upload produced CSV/JSON summaries and predictions as ClearML artifacts."""
-    if task is None:
-        return
-
-    artifact_files = [
-        "resolved_frozen_model_runs.csv",
-        "copy_forward_episode_plan.csv",
-        "copy_forward_eligible_visits.csv",
-        "copy_forward_cohort_summary.csv",
-        "copy_forward_injection_summary.csv",
-        "zero_percent_baseline_agreement.csv",
-        "copy_forward_metrics_by_seed.csv",
-        "copy_forward_ensemble_metrics.csv",
-        "copy_forward_representation_robustness_bootstrap.csv",
-        "resolved_copy_forward_config.json",
-        "copy_forward_predictions.csv",
-        "copy_forward_ensemble_predictions.csv",
-    ]
-
-    for filename in artifact_files:
-        path = output_dir / filename
-        if not path.exists():
-            print(f"ClearML artifact skipped, file not found: {path}")
-            continue
-        artifact_name = path.stem
-        print(f"Uploading ClearML artifact: {artifact_name} <- {path}")
-        task.upload_artifact(
-            name=artifact_name,
-            artifact_object=str(path.resolve()),
-            wait_on_upload=False,
-        )
-
-
-def report_clearml_metrics(task, ensemble_metrics: pd.DataFrame, robustness: pd.DataFrame) -> None:
-    """Report compact scalar series to the ClearML plots tab."""
-    if task is None:
-        return
-
-    logger = task.get_logger()
-    metric_names = [
-        "auroc",
-        "auprc",
-        "brier",
-        "logloss",
-        "top_10pct_precision",
-        "mean_abs_delta_risk_vs_0",
-        "p95_abs_delta_risk_vs_0",
-        "spearman_risk_vs_0",
-    ]
-
-    for row in ensemble_metrics.to_dict("records"):
-        fraction_pct = int(round(float(row["copy_fraction"]) * 100))
-        series = f'{row["task"]}/{row["compression_version"]}'
-        for metric in metric_names:
-            value = row.get(metric)
-            if value is None or not np.isfinite(value):
-                continue
-            logger.report_scalar(
-                title=f"copy_forward/{metric}",
-                series=series,
-                iteration=fraction_pct,
-                value=float(value),
-            )
-
-    for row in robustness.to_dict("records"):
-        fraction_pct = int(round(float(row["copy_fraction"]) * 100))
-        logger.report_scalar(
-            title="copy_forward/robustness_raw_minus_compressed",
-            series=str(row["task"]),
-            iteration=fraction_pct,
-            value=float(row["point_mean"]),
-        )
 
 
 def parse_csv_list(value: str) -> list[str]:
@@ -477,56 +250,6 @@ def maybe_download_file(remote_url: str, local_path: Path) -> Path:
         cached_path = matches[0]
     shutil.copy2(cached_path, local_path)
     return local_path
-
-
-def ensure_sequence_vocabs(
-    sequence_data_dir: Path,
-    sequence_data_s3_prefix: str,
-    tasks: Iterable[str],
-    versions: Iterable[str],
-) -> None:
-    """Download only the vocab files required for frozen inference."""
-    for task in tasks:
-        for version in versions:
-            local_path = sequence_data_dir / task / version / "vocab.json"
-            if local_path.exists():
-                continue
-            if not sequence_data_s3_prefix.strip():
-                raise FileNotFoundError(
-                    f"Missing vocab file: {local_path}. "
-                    "Pass --sequence-data-s3-prefix for remote execution."
-                )
-            remote_url = (
-                sequence_data_s3_prefix.rstrip("/")
-                + f"/{task}/{version}/vocab.json"
-            )
-            print(f"Download vocab: {remote_url} -> {local_path}")
-            maybe_download_file(remote_url, local_path)
-
-
-def ensure_history_cache(builder, tasks: Iterable[str]) -> None:
-    """Build the strict pre-prediction history cache when it is absent."""
-    missing: list[str] = []
-    for task in tasks:
-        manifest = builder.task_history_dir(task) / "manifest.json"
-        if not manifest.exists():
-            missing.append(task)
-            continue
-        try:
-            if builder.validate_history_manifest(manifest) is None:
-                missing.append(task)
-        except Exception:
-            missing.append(task)
-
-    if not missing:
-        print("History cache preflight: all requested task caches are available")
-        return
-
-    print(f"History cache missing for tasks={missing}; rebuilding from EHRSHOT_MEDS")
-    builder.build_base_cache()
-    for task in missing:
-        labels = builder.load_labels(task)
-        builder.build_task_history_parts(task, labels)
 
 
 def read_run_sources(
@@ -657,13 +380,7 @@ def build_candidate_plan_for_part(
     selected_eligible = (
         eligible_all.rename({"code": "candidate_code"})
         .join(
-            ranked.select(
-                EXAMPLE_KEYS
-                + [
-                    "candidate_code",
-                    "n_eligible_visits",
-                ]
-            ),
+            ranked.select(EXAMPLE_KEYS + ["candidate_code"]),
             on=EXAMPLE_KEYS + ["candidate_code"],
             how="inner",
         )
@@ -671,7 +388,6 @@ def build_candidate_plan_for_part(
             EXAMPLE_KEYS
             + [
                 "candidate_code",
-                "n_eligible_visits",
                 "compression_bucket",
                 "visit_time",
             ]
@@ -1147,7 +863,6 @@ def main() -> None:
     args = parse_args()
     project_root = Path.cwd().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    clearml_task = init_clearml_local(args)
 
     builder_module = load_module(args.builder_script, "state_or_space_builder")
     trainer_module = load_module(args.trainer_script, "state_or_space_trainer")
@@ -1169,14 +884,6 @@ def main() -> None:
         run_config_path=dataset_config_path,
         rebuild=False,
         rebuild_cache=False,
-    )
-
-    ensure_history_cache(builder, tasks)
-    ensure_sequence_vocabs(
-        sequence_data_dir=args.sequence_data_dir,
-        sequence_data_s3_prefix=args.sequence_data_s3_prefix,
-        tasks=tasks,
-        versions=versions,
     )
 
     sources = read_run_sources(
@@ -1622,13 +1329,6 @@ def main() -> None:
     (args.output_dir / "resolved_copy_forward_config.json").write_text(
         json.dumps(resolved, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-    if clearml_task is not None:
-        report_clearml_metrics(clearml_task, ensemble_metrics, robustness)
-        if args.clearml_upload_artifacts:
-            upload_clearml_outputs(clearml_task, args.output_dir)
-        clearml_task.flush(wait_for_uploads=True)
-        clearml_task.close()
 
     print("\nARTIFICIAL COPY-FORWARD INFERENCE TEST DONE")
     print(f"Output: {args.output_dir}")
