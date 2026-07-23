@@ -266,7 +266,6 @@ def clearml_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         value = config.get(key)
         config[key] = "" if value is None else str(value)
     config["run_config"] = [str(x) for x in (config.get("run_config") or [])]
-    config["script_version"] = SCRIPT_VERSION
     config["no_training"] = True
     return config
 
@@ -314,7 +313,6 @@ def args_from_clearml_config(
         values[key] = _to_bool(values.get(key, False))
 
     # Internal informational fields are not argparse attributes.
-    values.pop("script_version", None)
     values.pop("no_training", None)
     return argparse.Namespace(**values)
 
@@ -379,7 +377,6 @@ def init_clearml_and_sync(
         task.set_base_docker(args.clearml_docker_image.strip())
 
     print("ClearML inference task initialized:")
-    print(f"  script_version = {SCRIPT_VERSION}")
     print(f"  task_id = {task.id}")
     print(f"  project = {args.clearml_project}")
     print(f"  task_name = {args.clearml_task_name}")
@@ -1214,7 +1211,6 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     clearml_task, args = init_clearml_and_sync(args)
-    print(f"SCRIPT_VERSION: {SCRIPT_VERSION}")
 
     project_root = Path.cwd().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
