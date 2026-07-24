@@ -1,0 +1,12 @@
+python=3.12.5 (v3.12.5:ff3bc82f7c9, Aug  7 2024, 05:32:06) [Clang 13.0.0 (clang-1300.0.29.30)]
+platform=macOS-26.5.2-arm64-arm-64bit
+numpy=1.26.4
+pandas=2.2.3
+polars=1.31.0
+pyarrow=17.0.0
+scipy=1.13.1
+sklearn=1.5.2
+torch=2.7.0
+clearml=2.1.9
+boto3=1.43.34
+matplotlib=3.11.1

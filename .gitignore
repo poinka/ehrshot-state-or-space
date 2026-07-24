@@ -63,3 +63,12 @@ ehrshot_copy_forward_perturbation*/
 *.tmp
 *.bak
 *.log
+
+
+# Private reproducibility package
+state_or_space_reproducibility_package/
+state_or_space_reproducibility_package.zip
+
+# Temporary/local outputs
+.public_results_cache/
+public_results.zip

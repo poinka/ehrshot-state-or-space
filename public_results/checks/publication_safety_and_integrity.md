@@ -1,0 +1,9 @@
+| check | status | details |
+| --- | --- | --- |
+| split_audit | PASS | 9/9 checks OK |
+| representation_invariants | PASS | 132/132 checks passed |
+| final_ensemble_matrix | PASS | rows=14; expected=14 |
+| copy_forward_aggregate_matrix | PASS | groups=16; expected=16 |
+| zero_percent_reconstruction_recorded | PASS | rows=20; max_abs_logit_difference=0.0050174; max_abs_calibrated_risk_difference=0.000343981 |
+| prediction_time_protocol | PASS | event_time <= prediction_time |
+| public_output_contains_no_row_level_sources | PASS | Only aggregate source files are read and only derived aggregate outputs are written |

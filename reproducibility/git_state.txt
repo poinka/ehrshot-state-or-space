@@ -1,0 +1,4 @@
+commit=f2f3962e7af583d0c84fac59962331b3ca43bc91
+branch=main
+dirty=false
+captured_at_utc=2026-07-24T11:31:11Z

@@ -1,0 +1,30 @@
+{
+  "script_version": "state-or-space-public-results-v1-20260724",
+  "created_at_utc": "2026-07-24T11:53:03.240799+00:00",
+  "tasks": [
+    "guo_readmission",
+    "guo_icu"
+  ],
+  "models": {
+    "guo_readmission": "RETAIN_lite_numeric",
+    "guo_icu": "GRU_2L_numeric"
+  },
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "prediction_time_rule": "event_time <= prediction_time",
+  "calibration_fit_split": "tuning",
+  "evaluation_split": "held_out",
+  "patient_cluster_bootstrap_repetitions": 10000,
+  "copy_forward_fractions": [
+    0.0,
+    0.25,
+    0.5,
+    1.0
+  ],
+  "contains_row_level_data": false
+}
