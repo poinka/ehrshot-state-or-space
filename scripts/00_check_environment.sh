@@ -19,7 +19,18 @@ required = [
     Path("final_exps/04_artificial_copy_forward_inference.py"),
     Path("final_exps/05_analyze_copy_forward_robustness.py"),
     Path("final_exps/06_prepare_final_reproducibility_package.py"),
+    Path("final_exps/07_prepare_public_results.py"),
     Path("final_exps/common_ehrshot_eval.py"),
+    Path("scripts/00_check_environment.sh"),
+    Path("scripts/01_run_whitelist_clearml.sh"),
+    Path("scripts/02_run_dataset_builder_clearml.sh"),
+    Path("scripts/03_run_training_clearml.sh"),
+    Path("scripts/04_run_analysis_clearml.sh"),
+    Path("scripts/05_run_copy_forward_inference_mps.sh"),
+    Path("scripts/06_run_copy_forward_analysis.sh"),
+    Path("scripts/07_prepare_reproducibility_package.sh"),
+    Path("scripts/08_record_provenance.sh"),
+    Path("scripts/09_prepare_public_results.sh"),
     Path("configs/state_or_space_sequence_datasets.json"),
     Path("configs/state_or_space_core_4096_runs.json"),
     Path("configs/state_or_space_context_16384_runs.json"),
@@ -106,6 +117,7 @@ python -m py_compile \
   final_exps/04_artificial_copy_forward_inference.py \
   final_exps/05_analyze_copy_forward_robustness.py \
   final_exps/06_prepare_final_reproducibility_package.py \
+  final_exps/07_prepare_public_results.py \
   final_exps/common_ehrshot_eval.py
 
 for config in \
@@ -117,6 +129,51 @@ for config in \
   configs/state_or_space_analysis_5seeds.json; do
   python -m json.tool "$config" >/dev/null
 done
+
+for script in \
+  scripts/00_check_environment.sh \
+  scripts/01_run_whitelist_clearml.sh \
+  scripts/02_run_dataset_builder_clearml.sh \
+  scripts/03_run_training_clearml.sh \
+  scripts/04_run_analysis_clearml.sh \
+  scripts/05_run_copy_forward_inference_mps.sh \
+  scripts/06_run_copy_forward_analysis.sh \
+  scripts/07_prepare_reproducibility_package.sh \
+  scripts/08_record_provenance.sh \
+  scripts/09_prepare_public_results.sh; do
+  bash -n "$script"
+done
+
+if [[ -d public_results ]]; then
+  python - <<'PY_PUBLIC'
+from pathlib import Path
+import pandas as pd
+
+root = Path("public_results")
+required = [
+    root / "PUBLICATION_SAFETY_MANIFEST.csv",
+    root / "checks/publication_safety_and_integrity.csv",
+    root / "figures/figure_1_primary_comparisons_forest.png",
+    root / "figures/figure_2_copy_forward_probability_stability.png",
+]
+missing = [str(path) for path in required if not path.exists()]
+if missing:
+    raise SystemExit("Incomplete public_results directory:\n" + "\n".join(missing))
+
+safety = pd.read_csv(root / "PUBLICATION_SAFETY_MANIFEST.csv")
+if not safety["safe"].astype(bool).all():
+    bad = safety.loc[~safety["safe"].astype(bool)]
+    raise SystemExit("Unsafe public result files:\n" + bad.to_string(index=False))
+
+checks = pd.read_csv(root / "checks/publication_safety_and_integrity.csv")
+if not checks["status"].eq("PASS").all():
+    bad = checks.loc[~checks["status"].eq("PASS")]
+    raise SystemExit("Failed public result checks:\n" + bad.to_string(index=False))
+print(f"Public results: {len(safety)} publication-safe files; all integrity checks passed")
+PY_PUBLIC
+else
+  echo "public_results/ is absent; publication export check skipped."
+fi
 
 if [[ "$REQUIRE_LOCAL_DATA" == "1" ]]; then
   for path in \

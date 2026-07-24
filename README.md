@@ -49,6 +49,7 @@ final_exps/
 ├── 04_artificial_copy_forward_inference.py
 ├── 05_analyze_copy_forward_robustness.py
 ├── 06_prepare_final_reproducibility_package.py
+├── 07_prepare_public_results.py
 └── common_ehrshot_eval.py
 
 configs/
@@ -68,7 +69,8 @@ scripts/
 ├── 05_run_copy_forward_inference_mps.sh
 ├── 06_run_copy_forward_analysis.sh
 ├── 07_prepare_reproducibility_package.sh
-└── 08_record_provenance.sh
+├── 08_record_provenance.sh
+└── 09_prepare_public_results.sh
 ```
 
 Устаревший общий pipeline намеренно отсутствует: этапы запускаются отдельно, а завершение каждого тяжёлого этапа проверяется по ClearML и MinIO.
@@ -311,6 +313,57 @@ SKIP_REPRO_UPLOAD=1 \
 bash scripts/07_prepare_reproducibility_package.sh
 ```
 
+## 9. Публичные таблицы и рисунки
+
+Полный reproducibility package содержит приватные row-level артефакты и остаётся только в закрытом MinIO/ClearML. Для GitHub используется отдельный publication-safe экспорт:
+
+```bash
+bash scripts/09_prepare_public_results.sh
+```
+
+Скрипт `final_exps/07_prepare_public_results.py` читает только агрегированные результаты из приватного MinIO и создаёт папку:
+
+```text
+public_results/
+├── README.md
+├── RESULTS_SUMMARY.md
+├── RESULTS_SUMMARY_RU.md
+├── experiment_settings.json
+├── PUBLICATION_SAFETY_MANIFEST.csv
+├── SHA256SUMS.txt
+├── tables/
+│   ├── table_1_final_ensemble_results.csv
+│   ├── table_2_primary_comparisons.csv
+│   ├── table_3_copy_forward_robustness.csv
+│   └── table_4_history_coverage.csv
+├── figures/
+│   ├── figure_1_primary_comparisons_forest.png
+│   ├── figure_1_primary_comparisons_forest.pdf
+│   ├── figure_2_copy_forward_probability_stability.png
+│   └── figure_2_copy_forward_probability_stability.pdf
+└── checks/
+    └── publication_safety_and_integrity.csv
+```
+
+В public export не включаются patient-level или episode-level predictions, идентификаторы, diagnosis codes, checkpoints, EHR rows, copy-forward episode plans, ClearML task IDs и внутренние storage manifests. Перед завершением скрипт автоматически проверяет имена файлов и столбцы публичных CSV.
+
+Для локальной пересборки из уже скачанного приватного пакета без ClearML:
+
+```bash
+PUBLIC_RESULTS_SOURCE_ROOT=/path/to/state_or_space_reproducibility_package \
+PUBLIC_RESULTS_ENABLE_CLEARML=0 \
+bash scripts/09_prepare_public_results.sh
+```
+
+Опциональная загрузка безопасных результатов в отдельный MinIO prefix:
+
+```bash
+PUBLIC_RESULTS_S3_PREFIX="$EHRSHOT_S3_BASE/state_or_space_public_results" \
+bash scripts/09_prepare_public_results.sh
+```
+
+Папка [`public_results/`](public_results/) предназначена для публикации в GitHub. Приватные `state_or_space_reproducibility_package/` и `state_or_space_reproducibility_package.zip`, а также необязательный `public_results.zip` должны оставаться в `.gitignore`.
+
 ## Основные результаты
 
 Полный persistence-aware вариант не показал статистически устойчивого общего превосходства над raw ни для readmission, ни для ICU.
@@ -336,4 +389,4 @@ Copy-forward stress test оказался task-dependent:
 - `EHRSHOT.zip` и reproducibility package;
 - ClearML/MinIO credentials.
 
-Подробная карта приватных артефактов приведена в [`ARTIFACTS.md`](ARTIFACTS.md).
+Подробная карта приватных артефактов приведена в [`ARTIFACTS.md`](ARTIFACTS.md). Публикуемые агрегированные результаты находятся в [`public_results/`](public_results/), а краткие выводы — в [`public_results/RESULTS_SUMMARY_RU.md`](public_results/RESULTS_SUMMARY_RU.md).
