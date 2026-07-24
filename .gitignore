@@ -42,6 +42,8 @@ ehrshot_state_or_space_final_sequence_results/
 ehrshot_state_or_space_final_analysis/
 checkpoints/
 logs/
+ehrshot_state_or_space_final_analysis*/
+ehrshot_copy_forward_perturbation*/
 
 # Model/data artifacts
 *.parquet

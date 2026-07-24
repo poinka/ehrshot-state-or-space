@@ -11,3 +11,4 @@ scikit-learn==1.5.2
 tqdm==4.67.1
 clearml[s3]==2.1.9
 boto3==1.43.34
+matplotlib
